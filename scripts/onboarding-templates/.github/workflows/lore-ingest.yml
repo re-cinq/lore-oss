@@ -1,0 +1,45 @@
+name: Lore Context Ingest
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'CLAUDE.md'
+      - 'AGENTS.md'
+      - 'adrs/**'
+      - 'runbooks/**'
+      - 'teams/**'
+      - '.specify/**'
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get changed files
+        id: changes
+        run: |
+          FILES=$(git diff --name-only HEAD~1 HEAD | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Lore to ingest
+        if: steps.changes.outputs.files != '[]'
+        env:
+          LORE_INGEST_TOKEN: ${{ secrets.LORE_INGEST_TOKEN }}
+          LORE_INGEST_URL: ${{ vars.LORE_INGEST_URL }}
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${LORE_INGEST_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"files\": ${FILES},
+              \"repo\": \"${{ github.repository }}\",
+              \"commit\": \"${{ github.sha }}\"
+            }" \
+            "${LORE_INGEST_URL:-${LORE_INGEST_URL}}/api/ingest" \
+            || echo "::warning::Could not reach Lore ingest endpoint"
+          env:
+            FILES: ${{ steps.changes.outputs.files }}

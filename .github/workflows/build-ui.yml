@@ -1,0 +1,78 @@
+name: Build and push Lore UI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web-ui/**'
+  pull_request:
+    paths:
+      - 'web-ui/**'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: re-cinq/lore-ui
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: web-ui
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Auth to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: n8n-cluster
+          location: europe-west1
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Restart deployment
+        run: kubectl rollout restart deployment/lore-ui -n lore-ui
+
+  smoke:
+    needs: deploy
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Wait for rollout
+        run: sleep 30
+      - name: Run smoke tests
+        run: bash scripts/smoke-test.sh
+        env:
+          LORE_API_URL: ${{ vars.LORE_API_URL }}
+          LORE_INGEST_TOKEN: ${{ secrets.LORE_INGEST_TOKEN }}

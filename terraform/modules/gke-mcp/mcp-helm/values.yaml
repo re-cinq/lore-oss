@@ -1,0 +1,49 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/re-cinq/lore-mcp
+  tag: latest
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: ghcr-pull-secret
+
+service:
+  type: ClusterIP
+  port: 3000
+
+resources:
+  limits:
+    cpu: "500m"
+    memory: 512Mi
+  requests:
+    cpu: "100m"
+    memory: 256Mi
+
+env:
+  MCP_TRANSPORT: http
+  PORT: "3000"
+  CONTEXT_PATH: /context
+  TASK_TYPES_PATH: /config/task-types.yaml
+  LORE_TEAM: platform
+  LORE_DB_HOST: lore-db-rw.alloydb.svc.cluster.local
+  LORE_DB_PORT: "5432"
+  LORE_DB_NAME: lore
+  LORE_DB_USER: lore
+
+dbPasswordSecret:
+  name: lore-mcp-db-password
+  key: password
+
+ingestTokenSecret:
+  name: lore-ingest-token
+  key: token
+
+configMap:
+  name: lore-mcp-config
+
+githubAppSecret:
+  name: github-app-credentials
+  appIdKey: app-id
+  privateKeyKey: private-key
+  installationIdKey: installation-id
