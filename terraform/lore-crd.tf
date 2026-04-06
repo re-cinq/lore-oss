@@ -30,11 +30,24 @@ resource "kubectl_manifest" "controller_rbac" {
 
 resource "kubectl_manifest" "loretask_controller" {
   yaml_body = templatefile("${path.module}/modules/gke-mcp/loretask-crd/controller-deployment.yaml", {
-    project_id = var.project_id
+    project_id   = var.project_id
+    lore_api_url = var.lore_api_url
   })
+
+  wait_for_rollout = false
 
   depends_on = [
     kubectl_manifest.controller_rbac,
+    kubernetes_namespace.lore_agent,
+  ]
+}
+
+# --- NetworkPolicy restricting Job pod egress ---
+
+resource "kubectl_manifest" "loretask_networkpolicy" {
+  yaml_body = file("${path.module}/modules/gke-mcp/loretask-crd/networkpolicy.yaml")
+
+  depends_on = [
     kubernetes_namespace.lore_agent,
   ]
 }

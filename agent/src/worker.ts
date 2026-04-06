@@ -10,6 +10,8 @@ import { callLLM, callLLMWithTool } from "./anthropic.js";
 import { platform } from "./platform.js";
 import { fetchRepoContext } from "./repo-context.js";
 import { buildPrompt, getTaskTypeConfig } from "./config.js";
+import { writeEpisode } from "./lib/episode-writer.js";
+import type { PipelineTask } from "@re-cinq/lore-shared";
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -28,11 +30,19 @@ async function setStatus(
   status: string,
   extra: Record<string, unknown> = {},
 ): Promise<void> {
+  // Allowlist of permitted column names to prevent SQL injection via dynamic keys
+  const ALLOWED_COLUMNS = new Set([
+    "pr_url", "pr_number", "target_branch", "failure_reason", "agent_id",
+    "log_url", "claimed_by", "claimed_at", "issue_number", "issue_url",
+    "review_iteration", "actor", "priority",
+  ]);
+
   const setClauses = ["status = $1", "updated_at = now()"];
   const params: unknown[] = [status];
   let idx = 2;
 
   for (const [key, value] of Object.entries(extra)) {
+    if (!ALLOWED_COLUMNS.has(key)) continue; // skip unknown columns
     setClauses.push(`${key} = $${idx}`);
     params.push(value);
     idx++;
@@ -107,16 +117,20 @@ export async function startWorker(): Promise<void> {
 }
 
 async function pollOnce(): Promise<void> {
-  // 30-second grace period: local runners claim tasks immediately,
-  // so we only pick up tasks that have been pending long enough for
-  // a local runner to claim first.  Also skip running-local tasks
-  // (already claimed by a local runner).
-  const task = await query<any>(
+  // Pick up tasks by priority:
+  // - 'immediate': no grace period, executed right away
+  // - 'normal': 30-second grace period for local runners to claim first
+  const task = await query<PipelineTask>(
     `SELECT * FROM pipeline.tasks
      WHERE status = 'pending'
        AND status != 'running-local'
-       AND created_at < now() - interval '30 seconds'
-     ORDER BY created_at ASC
+       AND (
+         (priority = 'immediate')
+         OR (created_at < now() - interval '30 seconds')
+       )
+     ORDER BY
+       CASE WHEN priority = 'immediate' THEN 0 ELSE 1 END,
+       created_at ASC
      LIMIT 1`,
   ).then((rows) => rows[0] ?? null);
 
@@ -395,6 +409,14 @@ Mark parallelizable tasks with [P]. Include file paths based on the actual proje
     target_branch: branchName,
   });
   await insertEvent(task.id, "running", "pr-created", { pr_url: pr.url });
+
+  // Auto-capture feature-request as episode
+  writeEpisode(
+    `Feature request spec generated for ${targetRepo}\nPM intent: ${pmIntent.substring(0, 300)}\nArtifacts: ${committed.join(", ")}\nPR: ${pr.url}`,
+    "ci",
+    `${targetRepo}/${task.id}`,
+  ).catch(() => {});
+
   console.log(`[agent] Task ${task.id} → PR ${pr.url} (${committed.length} spec artifacts)`);
 }
 
@@ -734,6 +756,14 @@ async function handleOnboard(
     target_branch: branchName,
   });
   await insertEvent(task.id, "running", "pr-created", { pr_url: pr.url });
+
+  // Auto-capture onboarding as episode
+  writeEpisode(
+    `Repo ${targetRepo} onboarded\nGenerated: ${committed.join(", ")}\nPR: ${pr.url}`,
+    "ci",
+    `${targetRepo}/${task.id}`,
+  ).catch(() => {});
+
   console.log(`[agent] Task ${task.id} → PR ${pr.url} (${committed.length} files)`);
 }
 

@@ -1,21 +1,17 @@
-import { initOtel, traceRetrieval, shutdownOtel } from "./otel.js";
+import { initOtel, traceRetrieval } from "./otel.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "node:http";
 import { z } from "zod";
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join, relative } from "node:path";
 import { globSync } from "glob";
 import pg from "pg";
 import {
   hybridSearch,
-  getContextFromDb,
-  getAdrsFromDb,
-  getFilePrHistory,
-  isAlloyDbAvailable,
+  isDbAvailable,
   setPool,
-  getHealthStatus,
   getQueryEmbedding,
 } from "./db.js";
 import { resolveAgentId } from "./agent-id.js";
@@ -26,10 +22,6 @@ import {
   listMemories,
   setMemoryPool,
   isMemoryDbAvailable,
-  sharedWrite,
-  sharedRead,
-  createSnapshot,
-  restoreSnapshot,
   agentHealth,
   agentStats,
 } from "./memory.js";
@@ -41,17 +33,20 @@ import {
   searchMemoryFile,
 } from "./memory-file.js";
 import { searchMemories } from "./memory-search.js";
-import { extractFacts, extractFactsFromEpisode } from "./facts.js";
+import { extractFacts, extractFactsFromEpisode, setFactsCostPool } from "./facts.js";
 import { extractAndUpdateGraph, queryLiveGraph } from "./graph.js";
 import { assembleContext, loadTemplates } from "./context-assembly.js";
+import { trackToolCall, dumpSessionLog } from "./session-tracker.js";
+import { handleApiRoute } from "./routes.js";
+
+// Secret redaction from shared package
+import { redactSecrets as sanitizeContent } from "@re-cinq/lore-shared";
 import { createHash } from "node:crypto";
 import {
   createTask,
   getTask,
   listTasks,
   cancelTask,
-  markTaskMerged,
-  handleReviewResult,
   setPipelinePool,
 } from './pipeline.js';
 import { loadTaskTypes, getTaskTypes } from './pipeline-config.js';
@@ -64,12 +59,9 @@ import {
 } from './tasks.js';
 import {
   getOnboardedReposWithCounts,
-  getAvailableRepos,
   onboardRepo,
-  checkOnboardingPRs,
 } from './repo-onboard.js';
 import { detectCurrentRepo } from './repo-detect.js';
-import { ingestFiles } from './ingest.js';
 
 const CONTEXT_PATH = process.env.CONTEXT_PATH || process.cwd();
 
@@ -80,169 +72,29 @@ function readFileSafe(path: string): string | null {
   try { return readFileSync(path, "utf-8"); } catch { return null; }
 }
 
-function parseFrontmatter(content: string): { meta: Record<string, unknown>; body: string } {
-  const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-  if (!match) return { meta: {}, body: content };
-  const meta: Record<string, unknown> = {};
-  for (const line of match[1].split("\n")) {
-    const kv = line.match(/^(\w[\w_]*):\s*(.+)$/);
-    if (kv) {
-      const val = kv[2].trim();
-      // Handle YAML arrays: [a, b] or bare value
-      if (val.startsWith("[") && val.endsWith("]")) {
-        meta[kv[1]] = val.slice(1, -1).split(",").map(s => s.trim().replace(/^['"]|['"]$/g, ""));
-      } else {
-        meta[kv[1]] = val.replace(/^['"]|['"]$/g, "");
-      }
-    }
-  }
-  return { meta, body: match[2] };
-}
-
 const server = new McpServer({ name: "@re-cinq/lore-mcp", version: "0.1.0" });
 
 // --- Latency tracking helper ---
 async function trackLatency(tool: string, fn: () => Promise<any>): Promise<any> {
   const start = Date.now();
-  const result = await fn();
-  const latencyMs = Date.now() - start;
-  if (dbPoolRef) {
-    dbPoolRef.query(
-      `INSERT INTO memory.audit_log (agent_id, operation, metadata) VALUES ($1, $2, $3)`,
-      ['system', tool, JSON.stringify({ latency_ms: latencyMs })],
-    ).catch(() => {});
+  let success = true;
+  try {
+    const result = await fn();
+    return result;
+  } catch (err) {
+    success = false;
+    throw err;
+  } finally {
+    const latencyMs = Date.now() - start;
+    trackToolCall(tool, latencyMs, success);
+    if (dbPoolRef) {
+      dbPoolRef.query(
+        `INSERT INTO memory.audit_log (agent_id, operation, metadata) VALUES ($1, $2, $3)`,
+        ['system', tool, JSON.stringify({ latency_ms: latencyMs })],
+      ).catch(() => {});
+    }
   }
-  return result;
 }
-
-// --- get_context ---
-server.tool(
-  "get_context",
-  "Returns context (CLAUDE.md, ADRs, conventions) for the current repo. Auto-detects which repo you're in from the git remote.",
-  { team: z.string().optional().describe('Team name (e.g., "payments"). Usually auto-detected — only set if you need a specific team.') },
-  async ({ team }) => {
-    const detectedRepo = detectCurrentRepo();
-    if (detectedRepo) {
-      console.error(`[lore] get_context: auto-detected repo ${detectedRepo}`);
-    }
-
-    // DB path: query by repo first, fall back to team schema
-    if (await isAlloyDbAvailable()) {
-      // Try repo-specific context first
-      if (detectedRepo) {
-        try {
-          const { rows } = await dbPoolRef.query(
-            `SELECT content FROM org_shared.chunks WHERE repo = $1 AND content_type = 'doc' ORDER BY ingested_at DESC`,
-            [detectedRepo],
-          );
-          if (rows.length > 0) {
-            const text = rows.map((r: any) => r.content).join("\n\n---\n\n");
-            return { content: [{ type: "text" as const, text }] };
-          }
-        } catch {}
-      }
-      // Fall back to team/org schema
-      const results = await getContextFromDb(team || "org_shared");
-      if (results.length > 0) {
-        const text = results.map((r: any) => r.content).join("\n\n---\n\n");
-        return { content: [{ type: "text" as const, text }] };
-      }
-    }
-
-    // Proxy to GKE: fetch repo context from the vector store
-    const apiUrl = process.env.LORE_API_URL;
-    const apiToken = process.env.LORE_INGEST_TOKEN;
-    if (apiUrl && apiToken && detectedRepo) {
-      try {
-        const res = await fetch(`${apiUrl}/api/context?repo=${encodeURIComponent(detectedRepo)}`, {
-          headers: { "Authorization": `Bearer ${apiToken}` },
-        });
-        if (res.ok) {
-          const data = await res.json() as any;
-          if (data.text) {
-            return { content: [{ type: "text" as const, text: data.text }] };
-          }
-        }
-      } catch {}
-    }
-
-    // File-based fallback: read CLAUDE.md from the CURRENT working directory (the repo the dev is in)
-    const cwdClaudeMd = readFileSafe(join(process.cwd(), "CLAUDE.md"));
-    if (cwdClaudeMd) {
-      let text = cwdClaudeMd;
-      // Also load org-level context from Lore
-      const orgContext = readFileSafe(join(CONTEXT_PATH, "CLAUDE.md"));
-      if (orgContext && CONTEXT_PATH !== process.cwd()) {
-        text = `# Org Context\n\n${orgContext}\n\n---\n\n# Repo Context\n\n${text}`;
-      }
-      return { content: [{ type: "text" as const, text }] };
-    }
-
-    // Last resort: Lore's own CLAUDE.md
-    const root = readFileSafe(join(CONTEXT_PATH, "CLAUDE.md"));
-    if (!root) {
-      return { content: [{ type: "text" as const, text: "No CLAUDE.md found in current repo or Lore context directory." }] };
-    }
-    return { content: [{ type: "text" as const, text: root }] };
-  }
-);
-
-// --- get_adrs ---
-server.tool(
-  "get_adrs",
-  "Returns ADRs filtered by domain and/or status, sorted by adr_number descending.",
-  {
-    domain: z.string().optional().describe('Filter by domain (e.g., "payments"). Matches ADR frontmatter domains array.'),
-    status: z.enum(["proposed", "accepted", "deprecated", "superseded"]).default("accepted").describe("ADR status filter. Defaults to accepted."),
-  },
-  async ({ domain, status }) => {
-    if (await isAlloyDbAvailable()) {
-      const results = await getAdrsFromDb(domain || "", status);
-      if (results.length === 0) {
-        return { content: [{ type: "text" as const, text: domain ? `No ADRs found for domain "${domain}" with status "${status}".` : `No ADRs found with status "${status}".` }] };
-      }
-      const text = results.map((r: any) => r.content).join("\n\n---\n\n");
-      return { content: [{ type: "text" as const, text }] };
-    }
-
-    // File-based fallback
-    const adrsDir = join(CONTEXT_PATH, "adrs");
-    if (!existsSync(adrsDir)) {
-      return { content: [{ type: "text" as const, text: `Error: adrs/ directory not found at ${adrsDir}.` }] };
-    }
-    let files: string[];
-    try { files = readdirSync(adrsDir).filter(f => f.endsWith(".md")); } catch {
-      return { content: [{ type: "text" as const, text: `Error: could not read adrs/ directory.` }] };
-    }
-
-    const adrs: { num: number; content: string }[] = [];
-    const allDomains = new Set<string>();
-
-    for (const file of files) {
-      const raw = readFileSafe(join(adrsDir, file));
-      if (!raw) continue;
-      const { meta } = parseFrontmatter(raw);
-      const metaStatus = (meta.status as string || "").toLowerCase();
-      const metaDomains: string[] = Array.isArray(meta.domains) ? meta.domains.map(String) : [];
-      metaDomains.forEach(d => allDomains.add(d));
-
-      if (metaStatus !== status) continue;
-      if (domain && !metaDomains.some(d => d.toLowerCase() === domain.toLowerCase())) continue;
-      const num = typeof meta.adr_number === "string" ? parseInt(meta.adr_number, 10) : (meta.adr_number as number ?? 0);
-      adrs.push({ num, content: raw });
-    }
-
-    adrs.sort((a, b) => b.num - a.num);
-
-    if (adrs.length === 0) {
-      const note = domain
-        ? `No ADRs found for domain "${domain}" with status "${status}". Available domains: ${[...allDomains].join(", ") || "none"}.`
-        : `No ADRs found with status "${status}".`;
-      return { content: [{ type: "text" as const, text: note }] };
-    }
-    return { content: [{ type: "text" as const, text: adrs.map(a => a.content).join("\n\n---\n\n") }] };
-  }
-);
 
 // --- search_context ---
 server.tool(
@@ -261,7 +113,7 @@ server.tool(
       console.error(`[lore] search_context: auto-detected repo ${detectedRepo}`);
     }
 
-    if (await isAlloyDbAvailable()) {
+    if (await isDbAvailable()) {
       const schema = team || "org_shared";
       let results = await hybridSearch(query, schema, limit);
 
@@ -318,19 +170,25 @@ server.tool(
 
 // --- Memory proxy helper (for local mode without DB) ---
 
-async function proxyMemory(action: string, params: Record<string, any>): Promise<string | null> {
+// --- API proxy helper (for local mode without DB) ---
+
+async function proxyToApi(endpoint: string, body: Record<string, any>): Promise<string | null> {
   const apiUrl = process.env.LORE_API_URL;
   const apiToken = process.env.LORE_INGEST_TOKEN;
   if (!apiUrl || !apiToken) return null;
   try {
-    const res = await fetch(`${apiUrl}/api/memory`, {
+    const res = await fetch(`${apiUrl}${endpoint}`, {
       method: "POST",
       headers: { "Authorization": `Bearer ${apiToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ action, ...params }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) return null;
     return JSON.stringify(await res.json());
   } catch { return null; }
+}
+
+function proxyMemory(action: string, params: Record<string, any>): Promise<string | null> {
+  return proxyToApi("/api/memory", { action, ...params });
 }
 
 // --- Memory tools ---
@@ -497,11 +355,18 @@ server.tool(
   async ({ content, source, ref, agent_id }) => {
     try {
       if (!isMemoryDbAvailable()) {
-        return { content: [{ type: "text" as const, text: "Episodes require PostgreSQL (LORE_DB_HOST not set)." }] };
+        // Proxy to GKE
+        const proxied = await proxyToApi("/api/episode", {
+          content, source, ref, agent_id: agent_id || resolveAgentId(),
+        });
+        if (proxied) return { content: [{ type: "text" as const, text: proxied }] };
+        return { content: [{ type: "text" as const, text: "Episodes require PostgreSQL or LORE_API_URL. Neither is configured." }] };
       }
       const agent = resolveAgentId(agent_id);
-      const contentHash = createHash("sha256").update(content).digest("hex");
-      const embedding = await getQueryEmbedding(content);
+      // Privacy filter: strip secrets before storing in org-wide memory
+      const safeContent = sanitizeContent(content);
+      const contentHash = createHash("sha256").update(safeContent).digest("hex");
+      const embedding = await getQueryEmbedding(safeContent);
       const embeddingStr = embedding ? `[${embedding.join(",")}]` : null;
 
       const { rows } = await dbPoolRef.query(
@@ -509,7 +374,7 @@ server.tool(
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (agent_id, content_hash) DO NOTHING
          RETURNING id`,
-        [agent, content, contentHash, source, ref || null, embeddingStr],
+        [agent, safeContent, contentHash, source, ref || null, embeddingStr],
       );
 
       if (rows.length === 0) {
@@ -523,23 +388,49 @@ server.tool(
         console.warn(`[episode] Fact extraction failed for ${episodeId}: ${err.message}`),
       );
 
-      // Graph extraction (async, best-effort, requires ANTHROPIC_API_KEY)
-      if (process.env.ANTHROPIC_API_KEY) {
+      // Graph extraction (async, best-effort)
+      {
+        const graphModel = process.env.LORE_FACT_MODEL || 'claude-haiku-4-5-20251001';
         const graphLlmCall = async (prompt: string) => {
+          const apiKey = process.env.ANTHROPIC_API_KEY;
+          if (!apiKey) {
+            // Fall back to Claude CLI (uses subscription, no API credits)
+            const { execFile } = await import('node:child_process');
+            const { promisify } = await import('node:util');
+            const execFileAsync = promisify(execFile);
+            const { stdout } = await execFileAsync('claude', ['-p', prompt, '--output-format', 'text'], {
+              timeout: 30_000,
+              env: { ...process.env },
+            });
+            return stdout.trim();
+          }
+          const start = Date.now();
           const res = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
-              'x-api-key': process.env.ANTHROPIC_API_KEY!,
+              'x-api-key': apiKey,
               'anthropic-version': '2023-06-01',
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-              model: process.env.LORE_FACT_MODEL || 'claude-sonnet-4-20250514',
+              model: graphModel,
               max_tokens: 1024,
               messages: [{ role: 'user', content: prompt }],
             }),
           });
           const json = await res.json() as any;
+          const durationMs = Date.now() - start;
+          // Track cost
+          if (json.usage && dbPoolRef) {
+            const inputCost = 0.8 / 1_000_000;
+            const outputCost = 4.0 / 1_000_000;
+            const costUsd = json.usage.input_tokens * inputCost + json.usage.output_tokens * outputCost;
+            dbPoolRef.query(
+              `INSERT INTO pipeline.llm_calls (task_id, job_name, model, input_tokens, output_tokens, cost_usd, duration_ms)
+               VALUES (NULL, 'graph-extraction', $1, $2, $3, $4, $5)`,
+              [graphModel, json.usage.input_tokens, json.usage.output_tokens, costUsd, durationMs],
+            ).catch(() => {});
+          }
           return json.content[0].text;
         };
         // Determine repo from ref (e.g. "owner/repo#42" -> "owner/repo")
@@ -559,38 +450,6 @@ server.tool(
       return { content: [{ type: "text" as const, text: JSON.stringify({ status: "ok", episode_id: episodeId, source, ref }) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `Error writing episode: ${err.message}` }] };
-    }
-  }
-);
-
-server.tool(
-  "list_episodes",
-  "List recent episodes ingested by an agent. Returns episodes with their extracted fact count.",
-  {
-    agent_id: z.string().optional().describe("Override agent ID."),
-    source: z.string().optional().describe('Filter by source tag (e.g. "pr-review").'),
-    limit: z.number().default(20),
-  },
-  async ({ agent_id, source, limit }) => {
-    try {
-      if (!isMemoryDbAvailable()) {
-        return { content: [{ type: "text" as const, text: "Episodes require PostgreSQL (LORE_DB_HOST not set)." }] };
-      }
-      const agent = resolveAgentId(agent_id);
-      const { rows } = await dbPoolRef.query(
-        `SELECT e.id, e.source, e.ref, e.created_at,
-                LEFT(e.content, 200) as content_preview,
-                (SELECT count(*)::int FROM memory.facts f WHERE f.episode_id = e.id) as fact_count
-         FROM memory.episodes e
-         WHERE e.agent_id = $1
-           AND ($2::text IS NULL OR e.source = $2)
-         ORDER BY e.created_at DESC
-         LIMIT $3`,
-        [agent, source || null, limit],
-      );
-      return { content: [{ type: "text" as const, text: JSON.stringify(rows, null, 2) }] };
-    } catch (err: any) {
-      return { content: [{ type: "text" as const, text: `Error listing episodes: ${err.message}` }] };
     }
   }
 );
@@ -640,7 +499,26 @@ server.tool(
     return trackLatency('assemble_context', async () => {
       try {
         if (!isMemoryDbAvailable()) {
-          return { content: [{ type: "text" as const, text: "Context assembly requires PostgreSQL (LORE_DB_HOST not set)." }] };
+          // Proxy to GKE
+          const apiUrl = process.env.LORE_API_URL;
+          const apiToken = process.env.LORE_INGEST_TOKEN;
+          if (apiUrl && apiToken) {
+            try {
+              const resolvedRepo = repo || detectCurrentRepo() || "";
+              const params = new URLSearchParams({ query, template, repo: resolvedRepo });
+              const res = await fetch(`${apiUrl}/api/context?${params}`, {
+                headers: { "Authorization": `Bearer ${apiToken}` },
+              });
+              if (res.ok) {
+                const data = await res.json() as any;
+                if (data.text) {
+                  const meta = `<!-- context: proxied from GKE, template=${template} -->\n\n`;
+                  return { content: [{ type: "text" as const, text: meta + data.text }] };
+                }
+              }
+            } catch { /* fall through */ }
+          }
+          return { content: [{ type: "text" as const, text: "Context assembly requires PostgreSQL or LORE_API_URL. Neither is configured." }] };
         }
         const result = await assembleContext(dbPoolRef, query, template, max_tokens, repo, agent_id);
         if (!result.text) {
@@ -655,118 +533,11 @@ server.tool(
   }
 );
 
-// --- Shared pool tools ---
-
-server.tool(
-  "shared_write",
-  "Write a memory to a shared pool visible to all agents in that pool.",
-  {
-    pool_name: z.string().describe("Name of the shared pool (e.g. 'team-decisions')."),
-    key: z.string().describe("Memory key."),
-    value: z.string().describe("Memory value (text)."),
-    agent_id: z.string().optional().describe("Override agent ID."),
-  },
-  async ({ pool_name, key, value, agent_id }) => {
-    try {
-      if (!isMemoryDbAvailable()) {
-        return { content: [{ type: "text" as const, text: "Shared pools require PostgreSQL (LORE_DB_HOST not set)." }] };
-      }
-      const embedding = await getQueryEmbedding(value);
-      const result = await sharedWrite(pool_name, key, value, agent_id, embedding || undefined);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
-    } catch (err: any) {
-      return { content: [{ type: "text" as const, text: `Error writing to shared pool: ${err.message}` }] };
-    }
-  }
-);
-
-server.tool(
-  "shared_read",
-  "Read memories from a shared pool. Returns a specific key or lists all pool entries.",
-  {
-    pool_name: z.string().describe("Name of the shared pool."),
-    key: z.string().optional().describe("Specific key to read. Omit to list all entries."),
-  },
-  async ({ pool_name, key }) => {
-    try {
-      if (!isMemoryDbAvailable()) {
-        return { content: [{ type: "text" as const, text: "Shared pools require PostgreSQL (LORE_DB_HOST not set)." }] };
-      }
-      const result = await sharedRead(pool_name, key);
-      if (!result || (Array.isArray(result) && result.length === 0)) {
-        return { content: [{ type: "text" as const, text: key ? `Key "${key}" not found in pool "${pool_name}".` : `Pool "${pool_name}" is empty or does not exist.` }] };
-      }
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    } catch (err: any) {
-      return { content: [{ type: "text" as const, text: `Error reading shared pool: ${err.message}` }] };
-    }
-  }
-);
-
-// --- Snapshot tools ---
-
-server.tool(
-  "create_snapshot",
-  "Create a point-in-time snapshot of all agent memories for later restoration.",
-  {
-    agent_id: z.string().optional().describe("Override agent ID."),
-  },
-  async ({ agent_id }) => {
-    try {
-      if (!isMemoryDbAvailable()) {
-        return { content: [{ type: "text" as const, text: "Snapshots require PostgreSQL (LORE_DB_HOST not set)." }] };
-      }
-      const result = await createSnapshot(agent_id);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    } catch (err: any) {
-      return { content: [{ type: "text" as const, text: `Error creating snapshot: ${err.message}` }] };
-    }
-  }
-);
-
-server.tool(
-  "restore_snapshot",
-  "Restore agent memories to a previous snapshot state.",
-  {
-    snapshot_id: z.string().describe("UUID of the snapshot to restore."),
-  },
-  async ({ snapshot_id }) => {
-    try {
-      if (!isMemoryDbAvailable()) {
-        return { content: [{ type: "text" as const, text: "Snapshots require PostgreSQL (LORE_DB_HOST not set)." }] };
-      }
-      const result = await restoreSnapshot(snapshot_id);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    } catch (err: any) {
-      return { content: [{ type: "text" as const, text: `Error restoring snapshot: ${err.message}` }] };
-    }
-  }
-);
-
-// --- Health & stats tools ---
-
-server.tool(
-  "agent_health",
-  "Returns health summary for an agent: memory count, last activity, snapshot count.",
-  {
-    agent_id: z.string().optional().describe("Override agent ID."),
-  },
-  async ({ agent_id }) => {
-    try {
-      if (!isMemoryDbAvailable()) {
-        return { content: [{ type: "text" as const, text: "Agent health requires PostgreSQL (LORE_DB_HOST not set)." }] };
-      }
-      const result = await agentHealth(agent_id);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    } catch (err: any) {
-      return { content: [{ type: "text" as const, text: `Error fetching agent health: ${err.message}` }] };
-    }
-  }
-);
+// --- Agent stats tool (merged: health + stats + recent episodes) ---
 
 server.tool(
   "agent_stats",
-  "Returns usage statistics: total memories, facts, searches, and shared pools created.",
+  "Returns comprehensive agent statistics: memory count, last activity, snapshot count, total memories, active/invalidated facts, searches, shared pools, and recent episodes.",
   {
     agent_id: z.string().optional().describe("Override agent ID."),
   },
@@ -775,7 +546,42 @@ server.tool(
       if (!isMemoryDbAvailable()) {
         return { content: [{ type: "text" as const, text: "Agent stats requires PostgreSQL (LORE_DB_HOST not set)." }] };
       }
-      const result = await agentStats(agent_id);
+      const agent = resolveAgentId(agent_id);
+
+      // Fetch health, stats, and recent episodes in parallel
+      const [healthResult, statsResult, episodesResult] = await Promise.all([
+        agentHealth(agent_id),
+        agentStats(agent_id),
+        dbPoolRef.query(
+          `SELECT e.id, e.source, e.ref, e.created_at,
+                  LEFT(e.content, 200) as content_preview,
+                  (SELECT count(*)::int FROM memory.facts f WHERE f.episode_id = e.id) as fact_count
+           FROM memory.episodes e
+           WHERE e.agent_id = $1
+           ORDER BY e.created_at DESC
+           LIMIT 5`,
+          [agent],
+        ).catch(() => ({ rows: [] })),
+      ]);
+
+      // Get total episode count
+      let episodeCount = 0;
+      try {
+        const { rows } = await dbPoolRef.query(
+          `SELECT count(*)::int as total FROM memory.episodes WHERE agent_id = $1`,
+          [agent],
+        );
+        episodeCount = rows[0]?.total || 0;
+      } catch {}
+
+      const result = {
+        ...healthResult,
+        ...statsResult,
+        recent_episodes: {
+          total_count: episodeCount,
+          latest: episodesResult.rows,
+        },
+      };
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `Error fetching agent stats: ${err.message}` }] };
@@ -787,18 +593,19 @@ server.tool(
 
 server.tool(
   "create_pipeline_task",
-  "Delegate a task to the Lore Agent on GKE. The agent picks it up, calls an LLM, and creates a PR. Available types: feature-request (PM intent → spec + tasks), onboard (add repo to Lore), general (open-ended), runbook (write ops runbook), implementation (code from spec), gap-fill (draft missing docs), review (review a PR).",
+  "Create a pipeline task. By default tasks go to the backlog (priority=normal) for developers to pick up locally. Set priority=immediate to have the GKE agent auto-execute it. Available types: feature-request (PM intent → spec + tasks), onboard (add repo to Lore), general (open-ended), runbook (write ops runbook), implementation (code from spec), gap-fill (draft missing docs), review (review a PR).",
   {
     description: z.string().describe("What should the agent do? Be specific — this is the primary instruction. For feature-request: describe the feature in plain language. For onboard: just the repo name."),
     task_type: z.string().default("general").describe('Task type: "feature-request", "onboard", "general", "runbook", "implementation", "gap-fill", "review".'),
     target_repo: z.string().optional().describe('Target GitHub repository in "owner/repo" format. Auto-detected from git remote if omitted.'),
+    priority: z.enum(["normal", "immediate"]).default("normal").describe('Task priority. "normal" = backlog (developers pick up locally). "immediate" = GKE agent auto-executes.'),
     context: z.object({
       spec_file: z.boolean().optional(),
       branch: z.string().optional(),
       seed_query: z.string().optional(),
     }).optional().describe("Additional context to pass to the agent."),
   },
-  async ({ description: desc, task_type, target_repo, context }) => {
+  async ({ description: desc, task_type, target_repo, priority, context }) => {
     try {
       if (!desc || !desc.trim()) {
         return { content: [{ type: "text" as const, text: "description is required and cannot be empty" }] };
@@ -817,21 +624,27 @@ server.tool(
         const res = await fetch(`${apiUrl}/api/task`, {
           method: "POST",
           headers: { "Authorization": `Bearer ${apiToken}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ description: desc, task_type, target_repo: resolvedRepo, context }),
+          body: JSON.stringify({ description: desc, task_type, target_repo: resolvedRepo, priority, context }),
         });
         if (!res.ok) {
           const err = await res.json().catch(() => ({ error: res.statusText }));
           return { content: [{ type: "text" as const, text: `Remote task creation failed: ${(err as any).error || res.statusText}` }] };
         }
         const result = await res.json() as any;
-        const msg = `Task created: ${result.task_id}\nType: ${task_type}\nRepo: ${resolvedRepo || 'default'}\n\nThe agent will pick this up within 30 seconds. A GitHub Issue will be created on the repo, and a PR will follow when the agent finishes. Check status with get_pipeline_status or list_pipeline_tasks.`;
+        const pickupMsg = priority === "immediate"
+          ? "The GKE agent will pick this up within 30 seconds."
+          : "Task added to backlog. Claim it locally with claim_and_run_locally, or set priority to immediate via the UI.";
+        const msg = `Task created: ${result.task_id}\nType: ${task_type}\nPriority: ${priority}\nRepo: ${resolvedRepo || 'default'}\n\n${pickupMsg}`;
         return { content: [{ type: "text" as const, text: msg }] };
       }
 
       const validTypes = getTaskTypes();
       const resolvedType = validTypes.includes(task_type) ? task_type : "general";
-      const result = await createTask(desc, resolvedType, resolvedRepo, "mcp", context || undefined);
-      const msg = `Task created: ${result.task_id}\nType: ${resolvedType}\nRepo: ${resolvedRepo || 'default'}\n\nThe agent will pick this up within 30 seconds. A GitHub Issue will be created on the repo, and a PR will follow when the agent finishes. Check status with get_pipeline_status or list_pipeline_tasks.`;
+      const result = await createTask(desc, resolvedType, resolvedRepo, "mcp", context || undefined, priority);
+      const pickupMsg = priority === "immediate"
+        ? "The GKE agent will pick this up within 30 seconds."
+        : "Task added to backlog. Claim it locally with claim_and_run_locally, or set priority to immediate via the UI.";
+      const msg = `Task created: ${result.task_id}\nType: ${resolvedType}\nPriority: ${priority}\nRepo: ${resolvedRepo || 'default'}\n\n${pickupMsg}`;
       return { content: [{ type: "text" as const, text: msg }] };
     } catch (err: any) {
       return { content: [{ type: "text" as const, text: `Error creating pipeline task: ${err.message}` }] };
@@ -873,8 +686,9 @@ server.tool(
   },
   async ({ repo, pr_number }) => {
     try {
-      const token = process.env.GITHUB_TOKEN;
-      if (!token) return { content: [{ type: "text" as const, text: "GITHUB_TOKEN not configured." }] };
+      const { getGitHubToken } = await import("./github-client.js");
+      const token = await getGitHubToken();
+      if (!token) return { content: [{ type: "text" as const, text: "GitHub not configured. Set GITHUB_APP_ID/PRIVATE_KEY/INSTALLATION_ID or GITHUB_TOKEN." }] };
 
       async function ghFetch(path: string): Promise<any> {
         const res = await fetch(`https://api.github.com${path}`, {
@@ -980,41 +794,21 @@ server.tool(
 );
 
 server.tool(
-  "mark_task_merged",
-  "Manually mark a pipeline task as merged. Use this after a PR has been merged on GitHub.",
+  "retry_task",
+  "Retry a failed pipeline task. Creates a new task with the same parameters and links it to the original.",
   {
-    task_id: z.string().describe("UUID of the pipeline task whose PR was merged."),
+    task_id: z.string().describe("UUID of the failed task to retry."),
   },
   async ({ task_id }) => {
     try {
       if (!process.env.LORE_DB_HOST) {
         return { content: [{ type: "text" as const, text: "Pipeline requires PostgreSQL (LORE_DB_HOST not set)." }] };
       }
-      const result = await markTaskMerged(task_id);
+      const { retryTask } = await import('./pipeline.js');
+      const result = await retryTask(task_id);
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
     } catch (err: any) {
-      return { content: [{ type: "text" as const, text: `Error marking task merged: ${err.message}` }] };
-    }
-  }
-);
-
-server.tool(
-  "submit_review_result",
-  "Submit a review result for a pipeline task. Approved tasks await human merge; rejected tasks get re-iterated (max 2 iterations) or escalated.",
-  {
-    task_id: z.string().describe("UUID of the pipeline task being reviewed."),
-    approved: z.boolean().describe("Whether the review approves the changes."),
-    comments: z.string().describe("Review comments. For rejections, explain what needs fixing."),
-  },
-  async ({ task_id, approved, comments }) => {
-    try {
-      if (!process.env.LORE_DB_HOST) {
-        return { content: [{ type: "text" as const, text: "Pipeline requires PostgreSQL (LORE_DB_HOST not set)." }] };
-      }
-      await handleReviewResult(task_id, approved, comments);
-      return { content: [{ type: "text" as const, text: JSON.stringify({ task_id, approved, status: approved ? 'approved' : 'changes-requested' }) }] };
-    } catch (err: any) {
-      return { content: [{ type: "text" as const, text: `Error submitting review: ${err.message}` }] };
+      return { content: [{ type: "text" as const, text: `Error retrying task: ${err.message}` }] };
     }
   }
 );
@@ -1233,11 +1027,15 @@ server.tool(
         return { content: [{ type: "text" as const, text: "Ingestion requires LORE_API_URL + LORE_INGEST_TOKEN. Run install.sh to configure." }] };
       }
 
-      // Get the latest commit SHA for the repo
+      // Get the latest commit SHA — only use local HEAD if repo matches
       let commit = "HEAD";
       try {
         const { execSync } = await import("node:child_process");
-        commit = execSync("git rev-parse HEAD", { encoding: "utf-8", timeout: 5000 }).trim();
+        const localRepo = detectCurrentRepo();
+        if (localRepo === resolvedRepo) {
+          commit = execSync("git rev-parse HEAD", { encoding: "utf-8", timeout: 5000 }).trim();
+        }
+        // For other repos, "HEAD" tells GitHub to use the default branch
       } catch {}
 
       const res = await fetch(`${apiUrl}/api/ingest`, {
@@ -1297,7 +1095,7 @@ server.tool(
         } catch { /* use generated UUID */ }
       }
 
-      const task = spawnLocalTask({
+      const task = await spawnLocalTask({
         taskId,
         prompt: args.description,
         repo,
@@ -1464,7 +1262,7 @@ server.tool(
       }
 
       // Spawn locally
-      const localTask = spawnLocalTask({
+      const localTask = await spawnLocalTask({
         taskId: task.id,
         prompt: task.description,
         repo: task.target_repo,
@@ -1538,44 +1336,6 @@ server.tool(
   }
 );
 
-// --- GitHub webhook helpers ---
-
-async function getGitHubToken(): Promise<string | null> {
-  // Prefer App auth (same as agent), fall back to GITHUB_TOKEN
-  const appId = process.env.GITHUB_APP_ID;
-  const pk = process.env.GITHUB_APP_PRIVATE_KEY;
-  const instId = process.env.GITHUB_APP_INSTALLATION_ID;
-  if (appId && pk && instId) {
-    try {
-      const { createAppAuth } = await import("@octokit/auth-app");
-      const auth = createAppAuth({ appId, privateKey: pk, installationId: instId });
-      const { token } = await auth({ type: "installation" });
-      return token;
-    } catch { /* fall through */ }
-  }
-  return process.env.GITHUB_TOKEN || null;
-}
-
-async function ghIssueComment(repo: string, issueNumber: number, body: string): Promise<void> {
-  const token = await getGitHubToken();
-  if (!token) return;
-  await fetch(`https://api.github.com/repos/${repo}/issues/${issueNumber}/comments`, {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "Accept": "application/vnd.github+json" },
-    body: JSON.stringify({ body }),
-  });
-}
-
-async function ghAddLabel(repo: string, issueNumber: number, label: string): Promise<void> {
-  const token = await getGitHubToken();
-  if (!token) return;
-  await fetch(`https://api.github.com/repos/${repo}/issues/${issueNumber}/labels`, {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "Accept": "application/vnd.github+json" },
-    body: JSON.stringify({ labels: [label] }),
-  });
-}
-
 // --- Start server ---
 async function main() {
   await initOtel();
@@ -1593,6 +1353,7 @@ async function main() {
     setPool(dbPool);
     setMemoryPool(dbPool);
     setPipelinePool(dbPool);
+    setFactsCostPool(dbPool);
     dbPoolRef = dbPool;
     console.error(`[lore] Database mode: PostgreSQL at ${dbHost}`);
   } else {
@@ -1611,468 +1372,23 @@ async function main() {
   if (mode === "http") {
     const port = parseInt(process.env.PORT || "3000", 10);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
+    const MAX_BODY_BYTES = 1_048_576; // 1MB
+
     const httpServer = createServer(async (req, res) => {
+      // Enforce body size limit on all POST requests
+      if (req.method === "POST") {
+        const contentLength = parseInt(req.headers["content-length"] || "0", 10);
+        if (contentLength > MAX_BODY_BYTES) {
+          res.writeHead(413, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "request body too large" }));
+          return;
+        }
+      }
+
       if (req.url === "/mcp" || req.url === "/mcp/") {
         await transport.handleRequest(req, res);
-      } else if (req.url === "/healthz") {
-        const health = await getHealthStatus();
-        const status = health.connected || !process.env.LORE_DB_HOST ? "ok" : "error";
-        const code = status === "error" ? 503 : 200;
-        // Add task and cost stats if DB is available
-        let tasks = { processed_today: 0, pending: 0 };
-        let todayCost = "0.00";
-        if (health.connected && dbPoolRef) {
-          try {
-            const [taskStats, costStats] = await Promise.all([
-              dbPoolRef.query(`SELECT count(*) FILTER (WHERE created_at > current_date)::int as today, count(*) FILTER (WHERE status = 'pending')::int as pending FROM pipeline.tasks`),
-              dbPoolRef.query(`SELECT COALESCE(SUM(cost_usd), 0)::numeric(10,2) as cost FROM pipeline.llm_calls WHERE created_at > current_date`),
-            ]);
-            tasks = { processed_today: taskStats.rows[0]?.today || 0, pending: taskStats.rows[0]?.pending || 0 };
-            todayCost = costStats.rows[0]?.cost || "0.00";
-          } catch { /* non-fatal */ }
-        }
-        res.writeHead(code, { "Content-Type": "application/json" }).end(JSON.stringify({ status, database: health, tasks, today_cost: todayCost }));
-      } else if (req.url?.startsWith("/api/repo-status") && req.method === "GET") {
-        // Statusline cache endpoint — returns onboarded, tasks, memories, auto_review
-        const url = new URL(req.url, `http://${req.headers.host}`);
-        const repo = url.searchParams.get("repo");
-        console.log(`[repo-status] repo=${repo} dbPoolRef=${!!dbPoolRef}`);
-        if (!repo || !dbPoolRef) {
-          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ onboarded: false }));
-          return;
-        }
-        try {
-          const repoRow = await dbPoolRef.query(`SELECT settings FROM lore.repos WHERE full_name = $1`, [repo]);
-          if (repoRow.rows.length === 0) {
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ onboarded: false, repo }));
-            return;
-          }
-          const settings = repoRow.rows[0].settings || {};
-          const running = await dbPoolRef.query(
-            `SELECT count(*) as c FROM pipeline.tasks WHERE target_repo = $1 AND status = 'running'`, [repo],
-          );
-          const prReady = await dbPoolRef.query(
-            `SELECT count(*) as c FROM pipeline.tasks WHERE target_repo = $1 AND status IN ('pr-created', 'review')`, [repo],
-          );
-          const memories = await dbPoolRef.query(`SELECT count(*) as c FROM memory.memories WHERE is_deleted = false`);
-          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
-            onboarded: true,
-            repo,
-            running: Number(running.rows[0]?.c || 0),
-            pr_ready: Number(prReady.rows[0]?.c || 0),
-            memories: Number(memories.rows[0]?.c || 0),
-            auto_review: settings.auto_review === true,
-          }));
-        } catch (err: any) {
-          console.error("[repo-status] Error:", err.message);
-          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ onboarded: false, error: err.message }));
-        }
-      } else if (req.url === "/api/ingest" && req.method === "POST") {
-        // Bearer token auth
-        const token = process.env.LORE_INGEST_TOKEN;
-        const auth = req.headers.authorization;
-        if (!token || auth !== `Bearer ${token}`) {
-          res.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "unauthorized" }));
-          return;
-        }
-        if (!dbPoolRef) {
-          res.writeHead(503, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "database not available" }));
-          return;
-        }
-        let body = "";
-        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-        req.on("end", async () => {
-          try {
-            const { files, repo, commit } = JSON.parse(body);
-            if (!Array.isArray(files) || !repo || !commit) {
-              res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "required: files (array), repo (string), commit (string)" }));
-              return;
-            }
-            const result = await ingestFiles(dbPoolRef, files, repo, commit);
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result));
-          } catch (err: any) {
-            console.error("[ingest] API error:", err.message);
-            res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-          }
-        });
-      } else if (req.url === "/api/onboard" && req.method === "POST") {
-        // Bearer token auth
-        const token = process.env.LORE_INGEST_TOKEN;
-        const auth = req.headers.authorization;
-        if (!token || auth !== `Bearer ${token}`) {
-          res.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "unauthorized" }));
-          return;
-        }
-        if (!dbPoolRef) {
-          res.writeHead(503, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "database not available" }));
-          return;
-        }
-        let body = "";
-        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-        req.on("end", async () => {
-          try {
-            const { repo } = JSON.parse(body);
-            if (!repo || !repo.includes("/")) {
-              res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "required: repo (owner/name format)" }));
-              return;
-            }
-            const result = await onboardRepo(dbPoolRef, repo);
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result));
-          } catch (err: any) {
-            console.error("[onboard] API error:", err.message);
-            res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-          }
-        });
-      } else if (req.url?.startsWith("/api/context") && req.method === "GET") {
-        // Get repo context from the vector store
-        const token = process.env.LORE_INGEST_TOKEN;
-        const auth = req.headers.authorization;
-        if (!token || auth !== `Bearer ${token}`) { res.writeHead(401).end(); return; }
-        const url = new URL(req.url, "http://localhost");
-        const repo = url.searchParams.get("repo");
-        try {
-          const parts: string[] = [];
-          // Repo-specific docs only
-          if (repo && dbPoolRef) {
-            const { rows } = await dbPoolRef.query(
-              `SELECT content, content_type, file_path FROM org_shared.chunks
-               WHERE repo = $1 AND content_type IN ('doc', 'adr', 'spec')
-               ORDER BY content_type, ingested_at DESC`,
-              [repo],
-            );
-            for (const r of rows) parts.push(r.content);
-          }
-          if (parts.length > 0) {
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ text: parts.join("\n\n---\n\n") }));
-          } else {
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ text: null }));
-          }
-        } catch (err: any) {
-          res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-        }
-      } else if (req.url?.startsWith("/api/task/") && req.method === "GET") {
-        // Get single task by ID
-        const token = process.env.LORE_INGEST_TOKEN;
-        const auth = req.headers.authorization;
-        if (!token || auth !== `Bearer ${token}`) { res.writeHead(401).end(); return; }
-        const taskId = req.url.replace("/api/task/", "");
-        try {
-          const task = await getTask(taskId);
-          if (!task) { res.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "not found" })); return; }
-          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(task));
-        } catch (err: any) {
-          res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-        }
-      } else if (req.url?.startsWith("/api/tasks") && req.method === "GET") {
-        // List tasks with optional status filter
-        const token = process.env.LORE_INGEST_TOKEN;
-        const auth = req.headers.authorization;
-        if (!token || auth !== `Bearer ${token}`) { res.writeHead(401).end(); return; }
-        const url = new URL(req.url, `http://localhost`);
-        const status = url.searchParams.get("status") || undefined;
-        const limit = Math.min(parseInt(url.searchParams.get("limit") || "20"), 100);
-        try {
-          const result = await listTasks(status, limit);
-          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result));
-        } catch (err: any) {
-          res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-        }
-      } else if (req.url === "/api/task" && req.method === "POST") {
-        // Create pipeline task via REST
-        const token = process.env.LORE_INGEST_TOKEN;
-        const auth = req.headers.authorization;
-        if (!token || auth !== `Bearer ${token}`) {
-          res.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "unauthorized" }));
-          return;
-        }
-        if (!dbPoolRef) {
-          res.writeHead(503, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "database not available" }));
-          return;
-        }
-        let body = "";
-        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-        req.on("end", async () => {
-          try {
-            const parsed = JSON.parse(body);
-
-            // Cancel action
-            if (parsed.action === "cancel" && parsed.task_id) {
-              await dbPoolRef.query(
-                `UPDATE pipeline.tasks SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'merged')`,
-                [parsed.task_id],
-              );
-              res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true, task_id: parsed.task_id }));
-              return;
-            }
-
-            // Create action (default)
-            const { description, task_type, target_repo, context } = parsed;
-            if (!description?.trim()) {
-              res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "description is required" }));
-              return;
-            }
-            const validTypes = getTaskTypes();
-            const resolvedType = validTypes.includes(task_type || "") ? task_type : "general";
-            const result = await createTask(description, resolvedType, target_repo, "remote-mcp", context || undefined);
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result));
-          } catch (err: any) {
-            console.error("[api/task] error:", err.message);
-            res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-          }
-        });
-      } else if (req.url === "/api/memory" && req.method === "POST") {
-        // Memory API — write, read, search, delete memories via REST
-        const token = process.env.LORE_INGEST_TOKEN;
-        const auth = req.headers.authorization;
-        if (!token || auth !== `Bearer ${token}`) {
-          res.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "unauthorized" }));
-          return;
-        }
-        let body = "";
-        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-        req.on("end", async () => {
-          try {
-            const { action, key, value, agent_id, ttl, query: searchQuery, limit, version, pool_name, repo } = JSON.parse(body);
-            let result: any;
-            const embedding = (action === "write" || action === "search") && (value || searchQuery) ? await getQueryEmbedding(value || searchQuery || "") : null;
-
-            switch (action) {
-              case "write":
-                if (!key || !value) { res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "key and value required" })); return; }
-                result = isMemoryDbAvailable()
-                  ? await writeMemory(key, value, agent_id, ttl, embedding || undefined, repo)
-                  : await writeMemoryFile(key, value, agent_id, ttl);
-                break;
-              case "read":
-                if (!key) { res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "key required" })); return; }
-                const ver = version === "all" ? "all" : version ? Number(version) : undefined;
-                result = isMemoryDbAvailable()
-                  ? await readMemory(key, agent_id, ver)
-                  : await readMemoryFile(key, agent_id, ver);
-                break;
-              case "search":
-                if (!searchQuery) { res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "query required" })); return; }
-                result = isMemoryDbAvailable()
-                  ? await searchMemories(dbPoolRef, searchQuery, agent_id, pool_name, limit || 10)
-                  : await searchMemoryFile(searchQuery, agent_id, limit || 10);
-                break;
-              case "delete":
-                if (!key) { res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "key required" })); return; }
-                result = isMemoryDbAvailable()
-                  ? await deleteMemory(key, agent_id)
-                  : await deleteMemoryFile(key, agent_id);
-                break;
-              case "list":
-                result = isMemoryDbAvailable()
-                  ? await listMemories(agent_id, limit || 50, 0)
-                  : await listMemoriesFile(agent_id, limit || 50, 0);
-                break;
-              default:
-                res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "action must be: write, read, search, delete, list" }));
-                return;
-            }
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(result));
-          } catch (err: any) {
-            res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-          }
-        });
-      } else if (req.url === "/api/episode" && req.method === "POST") {
-        // Write episode via REST — used by session summary hook
-        const token = process.env.LORE_INGEST_TOKEN;
-        const auth = req.headers.authorization;
-        if (token && auth !== `Bearer ${token}`) { res.writeHead(401).end("Unauthorized"); return; }
-        let body = "";
-        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-        req.on("end", async () => {
-          try {
-            const { content, source, ref, agent_id } = JSON.parse(body);
-            if (!content) { res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "content required" })); return; }
-            const agent = agent_id || 'unknown';
-            const contentHash = createHash("sha256").update(content).digest("hex");
-            const { rows } = await dbPoolRef.query(
-              `INSERT INTO memory.episodes (agent_id, content, content_hash, source, ref)
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (agent_id, content_hash) DO NOTHING
-               RETURNING id`,
-              [agent, content, contentHash, source || 'session', ref || null],
-            );
-            if (rows.length === 0) {
-              res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ status: "duplicate" }));
-              return;
-            }
-            // Trigger async fact extraction
-            extractFactsFromEpisode(rows[0].id, content, agent, dbPoolRef).catch(() => {});
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ status: "ok", episode_id: rows[0].id }));
-          } catch (err: any) {
-            res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-          }
-        });
-      } else if (req.url === "/api/webhook/github" && req.method === "POST") {
-        // GitHub webhook — issues.labeled event dispatch
-        const webhookSecret = process.env.LORE_WEBHOOK_SECRET;
-        const signature = req.headers["x-hub-signature-256"] as string | undefined;
-        const ghEvent = req.headers["x-github-event"] as string | undefined;
-
-        let rawBody = "";
-        req.on("data", (chunk: Buffer) => { rawBody += chunk.toString(); });
-        req.on("end", async () => {
-          // Validate HMAC SHA-256 signature
-          if (webhookSecret) {
-            if (!signature) {
-              res.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "missing signature" }));
-              return;
-            }
-            const { createHmac, timingSafeEqual } = await import("node:crypto");
-            const expected = "sha256=" + createHmac("sha256", webhookSecret).update(rawBody).digest("hex");
-            const sigBuf = Buffer.from(signature);
-            const expBuf = Buffer.from(expected);
-            if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
-              res.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "invalid signature" }));
-              return;
-            }
-          }
-
-          if (ghEvent !== "issues") {
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ skipped: true, reason: "not an issues event" }));
-            return;
-          }
-
-          let payload: any;
-          try {
-            payload = JSON.parse(rawBody);
-          } catch {
-            res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "invalid JSON" }));
-            return;
-          }
-
-          if (payload.action !== "labeled") {
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ skipped: true, reason: "not a labeled action" }));
-            return;
-          }
-
-          const repoFullName: string = payload.repository?.full_name;
-          const issue = payload.issue;
-          const addedLabel: string = payload.label?.name;
-
-          if (!repoFullName || !issue || !addedLabel) {
-            res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "missing required fields" }));
-            return;
-          }
-
-          // Fetch per-repo settings from lore.repos
-          let dispatchLabel = "lore";
-          let dispatchDefaultType = "general";
-          if (dbPoolRef) {
-            try {
-              const { rows } = await dbPoolRef.query(
-                `SELECT settings FROM lore.repos WHERE full_name = $1`,
-                [repoFullName],
-              );
-              if (rows.length > 0 && rows[0].settings) {
-                const settings = typeof rows[0].settings === "string" ? JSON.parse(rows[0].settings) : rows[0].settings;
-                if (settings.dispatch_label) dispatchLabel = settings.dispatch_label;
-                if (settings.dispatch_default_type) dispatchDefaultType = settings.dispatch_default_type;
-              }
-            } catch { /* use defaults */ }
-          }
-
-          if (addedLabel !== dispatchLabel) {
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ skipped: true, reason: "label does not match dispatch_label" }));
-            return;
-          }
-
-          if (!dbPoolRef) {
-            res.writeHead(503, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "database not available" }));
-            return;
-          }
-
-          const issueNumber: number = issue.number;
-          const issueTitle: string = issue.title || "";
-          const issueBody: string = issue.body || "";
-          const issueUrl: string = issue.html_url || "";
-          const issueLabels: string[] = (issue.labels || []).map((l: any) => l.name as string);
-
-          // Determine task type from labels
-          let taskType = dispatchDefaultType;
-          if (issueLabels.includes("lore:implementation")) taskType = "implementation";
-          else if (issueLabels.includes("lore:review")) taskType = "review";
-          else if (issueLabels.includes("lore:runbook")) taskType = "runbook";
-
-          // Duplicate prevention
-          try {
-            const { rows: existing } = await dbPoolRef.query(
-              `SELECT id FROM pipeline.tasks
-               WHERE issue_number = $1 AND target_repo = $2
-                 AND status NOT IN ('failed', 'cancelled')`,
-              [issueNumber, repoFullName],
-            );
-            if (existing.length > 0) {
-              const existingId = existing[0].id;
-              await ghIssueComment(repoFullName, issueNumber, `Already being worked on: task \`${existingId}\``);
-              res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ skipped: true, reason: "duplicate", task_id: existingId }));
-              return;
-            }
-          } catch (err: any) {
-            console.error("[webhook] duplicate check error:", err.message);
-          }
-
-          // Create pipeline task
-          const description = `${issueTitle}\n\n${issueBody}`.trim();
-          const contextBundle = {
-            github_issue_number: issueNumber,
-            github_issue_url: issueUrl,
-            github_issue_body: issueBody,
-          };
-
-          let taskResult: any;
-          try {
-            taskResult = await createTask(description, taskType, repoFullName, "github-webhook", contextBundle);
-            // Persist issue_number and issue_url on the task row
-            await dbPoolRef.query(
-              `UPDATE pipeline.tasks SET issue_number = $1, issue_url = $2 WHERE id = $3`,
-              [issueNumber, issueUrl, taskResult.task_id],
-            );
-          } catch (err: any) {
-            console.error("[webhook] createTask error:", err.message);
-            res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-            return;
-          }
-
-          // Comment on the issue and add lore-managed label (best-effort)
-          await Promise.allSettled([
-            ghIssueComment(repoFullName, issueNumber, `Lore agent is working on this. Task: \`${taskResult.task_id}\``),
-            ghAddLabel(repoFullName, issueNumber, "lore-managed"),
-          ]);
-
-          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ task_id: taskResult.task_id, status: taskResult.status }));
-        });
-      } else if (req.url === "/api/task-logs" && req.method === "POST") {
-        // Receive logs from local runner and write to GCS
-        const token = process.env.LORE_INGEST_TOKEN;
-        const auth = req.headers.authorization;
-        if (!token || auth !== `Bearer ${token}`) {
-          res.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "unauthorized" }));
-          return;
-        }
-        let body = "";
-        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-        req.on("end", async () => {
-          try {
-            const { task_id, repo, logs } = JSON.parse(body);
-            if (!task_id || !repo || !logs) {
-              res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "missing fields" }));
-              return;
-            }
-            const { Storage } = await import("@google-cloud/storage");
-            const bucket = new Storage().bucket(process.env.LORE_LOG_BUCKET || "lore-task-logs");
-            await bucket.file(`${repo}/${task_id}/output.log`).save(logs, { resumable: false, contentType: "text/plain" });
-            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }));
-          } catch (err: any) {
-            res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: err.message }));
-          }
-        });
       } else {
-        res.writeHead(404).end();
+        const handled = await handleApiRoute(req, res, dbPoolRef);
+        if (!handled) res.writeHead(404).end();
       }
     });
     await server.connect(transport);
@@ -2082,6 +1398,12 @@ async function main() {
   } else {
     const transport = new StdioServerTransport();
     await server.connect(transport);
+
+    // Dump session log on exit (for Stop hook to POST as episode)
+    const exitHandler = () => dumpSessionLog();
+    process.on("SIGTERM", exitHandler);
+    process.on("SIGINT", exitHandler);
+    process.on("beforeExit", exitHandler);
   }
 }
 

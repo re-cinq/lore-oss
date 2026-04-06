@@ -178,15 +178,31 @@ async function reconcile(lt: LoreTask): Promise<void> {
     spec: {
       activeDeadlineSeconds: (lt.spec.timeoutMinutes || 30) * 60,
       ttlSecondsAfterFinished: 300,
-      backoffLimit: 0,
+      backoffLimit: 1,
       template: {
+        metadata: {
+          labels: {
+            "lore.re-cinq.com/task-id": taskId,
+            "lore.re-cinq.com/component": "job",
+          },
+        },
         spec: {
           restartPolicy: "Never",
           imagePullSecrets: [{ name: "ghcr-pull-secret" }],
+          securityContext: {
+            runAsNonRoot: true,
+            runAsUser: 1000,
+            runAsGroup: 1000,
+            fsGroup: 1000,
+          },
           containers: [
             {
               name: "claude-runner",
               image: lt.spec.image || "ghcr.io/re-cinq/lore-claude-runner:latest",
+              securityContext: {
+                allowPrivilegeEscalation: false,
+                capabilities: { drop: ["ALL"] },
+              },
               env: [
                 { name: "TARGET_REPO", value: lt.spec.targetRepo },
                 { name: "BRANCH_NAME", value: lt.spec.branch },
@@ -209,6 +225,20 @@ async function reconcile(lt: LoreTask): Promise<void> {
                     secretKeyRef: {
                       name: tokenSecretName,
                       key: "github-token",
+                    },
+                  },
+                },
+                {
+                  name: "LORE_API_URL",
+                  value: process.env.LORE_INGEST_URL || "",
+                },
+                {
+                  name: "LORE_INGEST_TOKEN",
+                  valueFrom: {
+                    secretKeyRef: {
+                      name: "lore-ingest-token",
+                      key: "token",
+                      optional: true,
                     },
                   },
                 },
@@ -381,7 +411,7 @@ async function readPodLogs(jobName: string): Promise<string> {
  * Parse the "CHANGES=" line from pod logs to get changed file count.
  */
 function parseChangedFiles(logs: string): number {
-  const match = logs.match(/CHANGES=(\d+)/);
+  const match = logs.match(/CHANGES=\s*(\d+)/);
   return match ? parseInt(match[1], 10) : 0;
 }
 

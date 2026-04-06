@@ -6,11 +6,11 @@ PR history, and task state.
 
 ## Architecture
 
-**MCP server** (`mcp-server/src/index.ts`): TypeScript, serves context
-to Claude Code via MCP protocol. Dual transport: stdio for local
-(Phase 0), Streamable HTTP for GKE (Phase 1). Three core tools:
-`get_context`, `get_adrs`, `search_context`. Phase 1 adds pipeline
-delegation tools.
+**MCP server** (`mcp-server/src/index.ts` + `routes.ts`): TypeScript,
+serves context to Claude Code via MCP protocol. Dual transport: stdio
+for local (Phase 0), Streamable HTTP for GKE (Phase 1). Three core tools:
+`assemble_context`, `search_context`, `search_memory`. Pipeline
+delegation, local task runner, and 30+ tools total.
 
 **Vector store**: PostgreSQL + pgvector via CloudNativePG on GKE.
 Schema-per-team isolation. HNSW indexes for vector search, GIN for
@@ -51,6 +51,8 @@ gcloud auth for local dev.
 ## Key Components
 
 - `mcp-server/` — the MCP server (TypeScript)
+- `mcp-server/src/routes.ts` — HTTP API route handlers (extracted from index.ts)
+- `mcp-server/src/github-client.ts` — consolidated GitHub auth (App + token fallback)
 - `mcp-server/src/local-runner.ts` — local task runner (worktrees, background Claude Code)
 - `scripts/` — install.sh, lore-doctor, lore-init, glue scripts
 - `scripts/infra/` — setup-db.sh, setup-schedulers.sh, generate-embeddings.sh
@@ -70,26 +72,26 @@ gcloud auth for local dev.
 - `agent/src/jobs/loretask-watcher.ts` — polls LoreTasks, creates PRs, triggers auto-review
 - `mcp-server/src/context-assembly.ts` — context assembly with YAML templates
 - `mcp-server/templates/` — YAML context assembly templates (default, review, implementation, research)
+- `mcp-server/src/repo-validation.ts` — deterministic validation (lint/typecheck detection for Node/Go/Python/Rust)
+- `mcp-server/src/repo-validation-cli.ts` — CLI wrapper for validation in K8s Job pods
+- `scripts/slack-app-manifest.yaml` — Slack app manifest for /lore slash command
+- `agent/src/lib/episode-writer.ts` — shared episode writer with Haiku-driven auto-curation
+- `agent/src/jobs/memory-lifecycle.ts` — importance decay (eviction) + fact consolidation (pattern extraction)
+- `mcp-server/src/session-tracker.ts` — passive session tracking (tool calls, ring buffer, exit dump)
 - `evals/` — PromptFoo eval configs per team
 
 ## Agent Memory
 
-15 MCP memory tools for persistent agent memory:
+MCP memory tools for persistent agent memory:
 - **write_memory** — store a key-value memory with optional TTL
 - **read_memory** — retrieve a memory by key (supports version history)
 - **delete_memory** — soft-delete a memory
 - **list_memories** — paginated listing of active memories
 - **search_memory** — semantic search across memories and facts (supports `include_invalidated` for historical queries)
 - **write_episode** — ingest raw text (conversation, review, observation); auto-extracts facts and updates knowledge graph
-- **list_episodes** — list recent episodes with extracted fact counts
 - **query_graph** — query the live knowledge graph for entities and relationships
-- **assemble_context** — retrieve and assemble context from all sources into a structured, token-budgeted block (replaces multiple get_context + search_memory + get_adrs calls)
-- **shared_write** — write to a named shared pool (cross-agent)
-- **shared_read** — read from a shared pool
-- **create_snapshot** — snapshot all current memories for crash recovery
-- **restore_snapshot** — restore memories from a snapshot
-- **agent_health** — memory count, last active, snapshot count
-- **agent_stats** — total memories, active/invalidated facts, searches, daily breakdown
+- **assemble_context** — retrieve and assemble context from all sources into a structured, token-budgeted block
+- **agent_stats** — health, memory count, episode count, facts, searches, daily breakdown
 
 Memory is stored in the PostgreSQL `memory` schema (tables:
 `memories`, `memory_versions`, `facts`, `episodes`, `entities`,
@@ -174,7 +176,7 @@ beyond the initial install. There is no offline or local-only mode.
 ## GKE Deployment
 
 Four services in the `n8n-cluster` (europe-west1):
-- PostgreSQL + pgvector: `alloydb` namespace
+- PostgreSQL + pgvector: `lore-db` namespace
 - Lore Agent: `lore-agent` namespace
 - Lore MCP server: `mcp-servers` namespace
 - LoreTask controller: `lore-agent` namespace (watches LoreTask CRs, creates Job pods)
@@ -214,8 +216,9 @@ up the repo's content. Repos table: lore.repos.
 
 Tasks created via UI, MCP, or PR trigger agents on GKE.
 Pipeline tools: create_pipeline_task, get_pipeline_status,
-list_pipeline_tasks, cancel_task, mark_task_merged,
-submit_review_result. Task types configured in
+list_pipeline_tasks, cancel_task, retry_task. Local runner tools:
+run_task_locally, list_local_tasks, cancel_local_task.
+Task types configured in
 scripts/task-types.yaml:
 
 - **feature-request**: PM describes intent in plain language → agent generates spec.md, data-model.md, tasks.md following repo conventions. Opens a PR for engineer review.
@@ -233,10 +236,75 @@ K8s Job pods via the LoreTask CRD:
 1. Agent worker creates a LoreTask CR (custom resource)
 2. The loretask-controller watches CRs and creates Jobs with the
    claude-runner image
-3. Job pods: clone repo → run Claude Code → commit → push (or review)
-4. A watcher job in the agent creates a PR when the Job completes
-5. Agent deploys do NOT affect running Job pods — tasks survive
+3. Job pods: pre-load context via API → run Claude Code → run
+   deterministic validation (lint/typecheck) → commit → push
+4. If validation fails: one retry with fix prompt → if still fails,
+   mark `needs-human-help` (no PR created)
+5. A watcher job in the agent creates a PR when the Job completes
+6. Agent deploys do NOT affect running Job pods — tasks survive
    rollout restarts
+
+**Deterministic validation** (Minions-inspired): After the agent
+edits code, the runner detects repo tooling (package.json, go.mod,
+pyproject.toml, Cargo.toml) and runs lint/typecheck as mandatory
+pipeline stages. This happens in both local runner (`monitorTask`)
+and GKE runner (`entrypoint.sh`). Validation is scoped to changed
+files to avoid false positives from pre-existing issues.
+
+**Pre-run context hydration**: Before spawning Claude Code, both
+runners fetch assembled context from the Lore API (`/api/context`
+with `query` param). The agent starts with conventions, ADRs,
+memories, and graph on turn 1 instead of spending its first action
+calling `assemble_context`.
+
+**Subdirectory convention rules**: `.claude/rules/*.md` files are
+loaded conditionally during context assembly based on task query
+keywords. All four templates include a `rules` source at priority 1.
+
+**Slack integration**: `/lore [task_type] description` slash command
+creates pipeline tasks. Channel-to-repo mapping in
+`lore.repos.settings.slack_channel_id`. Watcher posts PR links,
+issue links, and failure messages back to the originating channel
+via `LORE_SLACK_BOT_TOKEN`.
+
+**Passive memory capture**: MCP server tracks all tool calls in
+memory (session-tracker.ts). On exit, dumps to
+`~/.lore/last-session.json`. Stop hook POSTs to
+`/api/session-summary` for automatic episode + fact extraction.
+No agent cooperation needed.
+
+**Post-task auto-curation**: After every task completion (PR created,
+no-changes, failure), an episode is automatically written via
+`episode-writer.ts`. For high-signal events (PRs, failures), Haiku
+extracts a "lesson learned" and stores it as a memory entry
+(`auto-curation/{ref}`).
+
+**Importance-based memory decay**: Daily job scores memories 0-10
+based on recency, content length, and key pattern. Evicts lowest-
+scoring when agent exceeds 500 memories. Also cleans up invalidated
+facts older than 30 days beyond 2000 cap.
+
+**Automatic consolidation**: Daily job groups recent facts (7-day
+lookback) by repo and calls Haiku to extract higher-level patterns.
+Stored as `consolidated/{repo}/{timestamp}` memories.
+
+**Privacy filtering**: All memory writes (episodes, memories) pass
+through `sanitizeContent()` / `redactSecrets()` to strip API keys,
+JWTs, private keys, connection strings, and bearer tokens before
+storage in the org-wide database.
+
+**API security**: Centralized auth in `routes.ts` — every `/api/*`
+route enforces bearer token validation before dispatch. Supports
+legacy single token (`LORE_INGEST_TOKEN`, full access) and per-client
+scoped tokens (`pipeline.api_tokens` table with SHA-256 hashes).
+Scopes: read, write, task, webhook, admin. Token management via
+`/api/tokens` endpoint. Webhooks (GitHub, Slack) use their own HMAC
+signature verification. Rate limiting: 30/min webhooks, 60/min task
+ops, 200/min other (in-memory sliding window). 1MB body size limit.
+
+**Job pod security**: Pods run as non-root (uid 1000), drop all
+Linux capabilities, disallow privilege escalation. NetworkPolicy
+restricts egress to DNS + HTTPS + internal Lore API only.
 
 **Autonomous review loop** (opt-in per repo via `auto_review` setting):
 - After implementation PR is created, watcher auto-creates a review

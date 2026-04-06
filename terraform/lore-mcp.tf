@@ -35,8 +35,12 @@ resource "helm_release" "lore_mcp" {
     value = "platform"
   }
   set {
+    name  = "env.GCP_PROJECT"
+    value = var.project_id
+  }
+  set {
     name  = "env.LORE_DB_HOST"
-    value = "lore-db-rw.alloydb.svc.cluster.local"
+    value = "lore-db-rw.lore-db.svc.cluster.local"
   }
   set {
     name  = "env.LORE_DB_PORT"
@@ -54,7 +58,7 @@ resource "helm_release" "lore_mcp" {
   # Secrets — reference ESO-managed K8s Secrets
   set {
     name  = "dbPasswordSecret.name"
-    value = "lore-db-password"
+    value = "lore-mcp-db-password"
   }
   set {
     name  = "dbPasswordSecret.key"
@@ -87,6 +91,5 @@ resource "helm_release" "lore_mcp" {
 
   depends_on = [
     kubernetes_namespace.mcp_servers,
-    kubernetes_config_map.mcp_config,
   ]
 }

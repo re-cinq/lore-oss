@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NS="alloydb"
+NS="lore-db"
 POD="lore-db-1"
 
 echo "[lore] Creating pipeline schema and tables..."
@@ -24,7 +24,8 @@ kubectl exec -n "$NS" "$POD" -- psql -U postgres -d lore -c "
     failure_reason   TEXT,
     created_by       TEXT NOT NULL DEFAULT 'ui',
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    priority         TEXT NOT NULL DEFAULT 'normal'
   );
 
   CREATE INDEX IF NOT EXISTS tasks_status_idx ON pipeline.tasks (status);
@@ -85,6 +86,28 @@ kubectl exec -n "$NS" "$POD" -- psql -U postgres -d lore -c "
     ALTER TABLE pipeline.tasks ADD COLUMN claimed_at TIMESTAMPTZ;
   EXCEPTION WHEN duplicate_column THEN NULL;
   END \$\$;
+
+  -- Task priority: 'normal' (backlog, wait for local pickup) or 'immediate' (GKE agent auto-executes)
+  DO \$\$ BEGIN
+    ALTER TABLE pipeline.tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal';
+  EXCEPTION WHEN duplicate_column THEN NULL;
+  END \$\$;
+  CREATE INDEX IF NOT EXISTS tasks_priority_idx ON pipeline.tasks (priority) WHERE status = 'pending';
+
+  -- Per-client API tokens with scoped permissions
+  CREATE TABLE IF NOT EXISTS pipeline.api_tokens (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT NOT NULL,
+    token_hash  TEXT NOT NULL UNIQUE,
+    scopes      TEXT[] NOT NULL DEFAULT '{read}',
+    created_by  TEXT NOT NULL,
+    expires_at  TIMESTAMPTZ,
+    revoked_at  TIMESTAMPTZ,
+    last_used   TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+
+  CREATE INDEX IF NOT EXISTS api_tokens_hash_idx ON pipeline.api_tokens (token_hash) WHERE revoked_at IS NULL;
 
   GRANT USAGE ON SCHEMA pipeline TO lore;
   GRANT ALL ON ALL TABLES IN SCHEMA pipeline TO lore;

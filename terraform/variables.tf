@@ -1,5 +1,5 @@
 variable "project_id" {
-  default = "re5-n8n-platform"
+  default = "your-gcp-project"
 }
 
 variable "region" {
@@ -61,6 +61,18 @@ variable "github_oauth_client_secret" {
 variable "nextauth_secret" {
   type      = string
   sensitive = true
+}
+
+variable "slack_signing_secret" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
+
+variable "slack_bot_token" {
+  type      = string
+  sensitive = true
+  default   = ""
 }
 
 variable "ghcr_pull_secret_dockerconfigjson" {

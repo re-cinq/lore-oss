@@ -21,7 +21,7 @@ terraform {
   }
 
   backend "gcs" {
-    bucket = "re5-n8n-terraform-state"
+    bucket = "your-terraform-state-bucket"
     prefix = "lore"
   }
 }

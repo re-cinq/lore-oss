@@ -21,7 +21,7 @@ resources:
     memory: 256Mi
 
 env:
-  LORE_DB_HOST: lore-db-rw.alloydb.svc.cluster.local
+  LORE_DB_HOST: lore-db-rw.lore-db.svc.cluster.local
   LORE_DB_PORT: "5432"
   LORE_DB_NAME: lore
   LORE_DB_USER: lore
@@ -47,5 +47,10 @@ githubAppSecret:
 
 configMap:
   name: lore-agent-config
+
+# Slack integration (optional — for PR/failure notifications back to Slack)
+slackBotTokenSecret:
+  name: lore-slack-credentials
+  key: bot-token
 
 gcpProject: ""

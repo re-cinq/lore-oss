@@ -60,6 +60,10 @@ A developer says "run locally" and Claude Code spawns a background process in an
 
 Same context flow as GKE tasks — the background process has its own MCP server instance, calls `assemble_context` and `search_memory` before coding.
 
+### Flow 6: Slack → Agent (slash command)
+
+A developer types `/lore implementation add retry logic to the webhook handler` in a Slack channel mapped to a repo. Lore creates the task, runs the agent, and posts the PR link back to the same channel. No context switch — stay in Slack.
+
 ### Agent Execution Modes
 
 | Mode | When | How |
@@ -69,6 +73,8 @@ Same context flow as GKE tasks — the background process has its own MCP server
 | **Multi-agent** | Large implementation tasks | Multiple LoreTask Jobs run in parallel. Each works on a different part of the task (e.g., one agent per file or module). Results merged into a single PR. |
 | **Feature request** | PM intent | Fetches repo context, generates spec/data-model/tasks as individual files. Each artifact gets its own focused LLM call. |
 | **Local runner** | Developer says "run locally" | Background `claude --print` in an isolated git worktree on the developer's machine. Uses Claude Code subscription — zero API cost. Non-blocking, PR created via `gh`. |
+
+All execution modes include **deterministic validation** — after the agent edits code, lint and typecheck run as mandatory pipeline stages (detected from package.json, go.mod, pyproject.toml, or Cargo.toml). If validation fails, one automatic fix retry runs before escalating to human review. K8s Jobs retry once on transient failures (`backoffLimit: 1`). Failed tasks can be retried via `/lore retry <task_id>`, the `retry_task` MCP tool, or the API.
 
 The agent service decides which mode to use based on the task type configured in `task-types.yaml`.
 
@@ -100,7 +106,13 @@ Key capabilities:
 - **Passive episode ingestion** — `write_episode` accepts raw text (conversations, reviews, observations); facts and knowledge graph entities are extracted automatically. PR review feedback is auto-captured by the review-reactor job. Session summaries are captured via a Stop hook.
 - **Live knowledge graph** — entities (services, teams, technologies) and relationships tracked in PostgreSQL, updated incrementally on every episode. Query with `query_graph`.
 - **Graph-augmented search** — `search_memory(graph_augment=true)` enriches results with 1-hop knowledge graph neighbors of detected entities
-- **Context assembly** — `assemble_context` retrieves from all sources and formats into a token-budgeted block using configurable YAML templates (default, review, implementation, research)
+- **Context assembly** — `assemble_context` retrieves from all sources and formats into a token-budgeted block using configurable YAML templates (default, review, implementation, research). Supports **subdirectory convention rules** — `.claude/rules/*.md` files loaded conditionally based on task keywords
+- **Pre-run hydration** — both local runner and GKE entrypoint fetch assembled context before spawning Claude Code, so agents start with rich context on turn 1
+- **Passive session capture** — MCP server tracks all tool calls; on session exit, dumps and POSTs a summary as an episode with automatic fact extraction. No explicit `write_episode` needed.
+- **Post-task auto-curation** — every task completion (PR, no-changes, failure) automatically captures an episode. High-signal events get Haiku-driven lesson extraction stored as searchable memories.
+- **Importance-based decay** — memories scored 0-10 by recency, content quality, and key pattern. Low-value entries auto-evicted when agent exceeds 500 memories. Old invalidated facts cleaned up beyond 2000 cap.
+- **Automatic consolidation** — groups recent facts by repo and synthesizes higher-level patterns via Haiku. Turns noisy raw facts into actionable insights.
+- **Privacy filtering** — secrets, API keys, JWTs, and connection strings automatically stripped before storing in org-wide memory.
 - **Retrieval benchmarks** — p50/p95/p99 latency tracked per tool in the audit log, visible in the analytics dashboard
 
 ### Repo Onboarding
@@ -132,6 +144,8 @@ After the PR is merged, the agent automatically configures ingest secrets so con
 | Eval runner | Daily 3 AM | Run PromptFoo evals for all teams, detect quality regressions |
 | Context core builder | Daily 4 AM | Compare context quality to baseline, promote improvements |
 | LoreTask watcher | Every 60s | Poll completed LoreTasks: create PRs, trigger auto-review, handle review results, clean up |
+| Importance decay | Daily 5 AM | Score memories by importance, evict low-value entries above cap, clean up old invalidated facts |
+| Consolidation | Daily 5:30 AM | Group recent facts by repo, extract higher-level patterns via Haiku, store as consolidated memories |
 | Autoresearch | Monday 6 AM | Find low-confidence queries from Langfuse, generate context candidates, open PRs |
 
 ## Getting Started
@@ -183,7 +197,8 @@ Architecture decisions are documented as ADRs in `adrs/`.
 | Code parsing | web-tree-sitter (TypeScript, Python, Go) |
 | GitHub | Octokit + `@octokit/auth-app` (GitHub App) |
 | Observability | OpenTelemetry traces + metrics |
-| Infrastructure | GKE, Helm, cert-manager, external-dns |
+| Slack | Slack Web API (`chat.postMessage`), HMAC-SHA256 verification |
+| Infrastructure | GKE, Helm, cert-manager, external-dns, ESO |
 
 ## How To
 
@@ -232,8 +247,7 @@ The MCP server runs locally via stdio and proxies all operations (context, memor
 
 | Tool | Category | What it does |
 |------|----------|-------------|
-| `get_context` | Context | Merged CLAUDE.md for current repo (auto-detected from git remote) |
-| `get_adrs` | Context | ADRs filtered by domain and status |
+| `assemble_context` | Context | Retrieve + assemble context from all sources (CLAUDE.md, ADRs, memories, facts, graph) into a token-budgeted block |
 | `search_context` | Context | Hybrid search (vector + keyword) across all org context |
 | `write_memory` | Memory | Store a persistent memory with optional TTL and fact extraction |
 | `read_memory` | Memory | Retrieve by key, supports version history |
@@ -241,23 +255,25 @@ The MCP server runs locally via stdio and proxies all operations (context, memor
 | `list_memories` | Memory | Paginated listing of active memories |
 | `delete_memory` | Memory | Soft-delete (preserved in history) |
 | `write_episode` | Memory | Ingest raw text; auto-extracts facts and updates knowledge graph |
-| `list_episodes` | Memory | List recent episodes with extracted fact counts |
 | `query_graph` | Memory | Query live knowledge graph for entities and relationships |
-| `assemble_context` | Memory | Retrieve + assemble context from all sources into a structured, token-budgeted block |
-| `shared_write` / `shared_read` | Memory | Cross-agent shared memory pools |
-| `create_snapshot` / `restore_snapshot` | Memory | Point-in-time backup and restore |
-| `agent_health` / `agent_stats` | Memory | Usage stats, active/invalidated facts, daily breakdown |
+| `agent_stats` | Memory | Health, memory count, episode count, facts, searches, daily breakdown |
 | `create_pipeline_task` | Pipeline | Create task on GKE (API cost) |
 | `run_task_locally` | Pipeline | Run task in background on dev machine (subscription, zero API cost) |
 | `list_local_tasks` | Pipeline | Show running/completed local background tasks |
 | `cancel_local_task` | Pipeline | Cancel a local background task |
+| `enable_task_notifications` | Pipeline | Start watching for pending tasks (statusline indicator) |
+| `list_pending_tasks` | Pipeline | Show tasks available to claim locally |
+| `claim_and_run_locally` | Pipeline | Claim a pending task and run in background |
 | `get_pipeline_status` | Pipeline | Task status and event timeline |
 | `list_pipeline_tasks` | Pipeline | List tasks with status filter |
 | `cancel_task` | Pipeline | Cancel a running or pending task |
+| `retry_task` | Pipeline | Retry a failed task (creates new task linked to original) |
+| `get_pr_status` | Pipeline | Live GitHub PR state (checks, reviews, merge status) |
 | `sync_tasks` | Tasks | Parse tasks.md and sync to pipeline database |
 | `ready_tasks` | Tasks | List unblocked tasks (all dependencies satisfied) |
 | `claim_task` | Tasks | Atomically claim a task to prevent double work |
 | `complete_task` | Tasks | Mark done, report newly unblocked dependents |
+| `get_analytics` | Repos | Cost/usage tracking by period |
 | `list_repos` | Repos | All onboarded repos with activity stats |
 | `onboard_repo` | Repos | Onboard a new repo to Lore |
 | `ingest_files` | Ingest | Manually ingest files into Lore's context store |
@@ -278,6 +294,29 @@ Lore comments with the existing task ID instead of creating a new one.
 
 Requires a webhook on the repo: `POST https://LORE_API_DOMAIN/api/webhook/github`
 with events `Issues` and HMAC secret from `LORE_WEBHOOK_SECRET`.
+
+### Slack Integration
+
+Type `/lore` in any mapped Slack channel to create tasks:
+
+```
+/lore implementation add rate limiting to the API
+/lore general analyze our test coverage gaps
+/lore runbook database failover procedure
+/lore retry <task_id>
+```
+
+Lore posts back to the channel when:
+- A PR is created (with link)
+- A task completes with a GitHub issue (with link)
+- A task fails (with error summary)
+
+**Setup:**
+1. Create a Slack app from `scripts/slack-app-manifest.yaml`
+2. Store signing secret and bot token in `secrets.tfvars` (`slack_signing_secret`, `slack_bot_token`)
+3. `terraform apply` to sync secrets via ESO
+4. Map channels to repos: `UPDATE lore.repos SET settings = settings || '{"slack_channel_id":"C..."}'`
+5. Invite the bot to each channel
 
 ### GitHub Issue Notifications
 
